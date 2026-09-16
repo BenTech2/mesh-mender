@@ -1,0 +1,11 @@
+{
+  "name": "mesh-mender",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Offline mesh repair for 3D printing — a replacement for Microsoft 3D Builder's repair tools.",
+  "type": "module",
+  "scripts": {
+    "start": "./serve.sh",
+    "test": "node test/run.mjs"
+  }
+}

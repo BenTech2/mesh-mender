@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mesh Mender — repair 3D models for printing</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔧</text></svg>">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">Mesh&nbsp;Mender</span>
+    <span class="brand-tag">mesh repair for 3D printing</span>
+  </div>
+
+  <div class="topbar-actions">
+    <button id="open-button" class="button primary">Open model</button>
+    <input type="file" id="file-input" accept=".stl,.obj,.3mf,.ply,model/stl,model/3mf" multiple hidden>
+    <button id="undo-button" class="button" disabled title="Undo (Ctrl+Z)">Undo</button>
+    <button id="redo-button" class="button" disabled title="Redo (Ctrl+Shift+Z)">Redo</button>
+    <div class="export-group">
+      <select id="export-format" class="select" aria-label="Export format">
+        <option value="3mf">3MF</option>
+        <option value="stl" selected>STL (binary)</option>
+        <option value="stl-ascii">STL (ASCII)</option>
+        <option value="obj">OBJ</option>
+      </select>
+      <button id="export-button" class="button" disabled>Save</button>
+    </div>
+  </div>
+</header>
+
+<main class="layout">
+
+  <aside class="panel panel-left">
+    <section class="panel-section">
+      <h2 class="section-title">Models</h2>
+      <ul id="model-list" class="model-list"></ul>
+      <p id="model-empty" class="muted small">Nothing loaded yet.</p>
+      <button id="separate-button" class="button small wide" hidden>Split into separate bodies</button>
+    </section>
+
+    <section class="panel-section" id="transform-section" hidden>
+      <h2 class="section-title">Position &amp; size</h2>
+      <dl class="facts" id="size-facts"></dl>
+
+      <div class="field-row">
+        <label class="field">
+          <span>Units in file</span>
+          <select id="unit-select" class="select">
+            <option value="millimeter">millimetres</option>
+            <option value="centimeter">centimetres</option>
+            <option value="inch">inches</option>
+            <option value="meter">metres</option>
+            <option value="micron">microns</option>
+          </select>
+        </label>
+        <button id="apply-unit" class="button small" title="Rescale the model as if it had been saved in the chosen unit">Convert</button>
+      </div>
+
+      <div class="field-row">
+        <label class="field">
+          <span>Scale %</span>
+          <input id="scale-input" class="input" type="number" value="100" min="0.01" step="1">
+        </label>
+        <button id="apply-scale" class="button small">Apply</button>
+      </div>
+
+      <p class="control-label">Rotate 90° about</p>
+      <div class="button-grid">
+        <button class="button small" data-rotate="x" title="Rotate 90° about X">X</button>
+        <button class="button small" data-rotate="y" title="Rotate 90° about Y">Y</button>
+        <button class="button small" data-rotate="z" title="Rotate 90° about Z">Z</button>
+      </div>
+      <p class="control-label">Mirror across</p>
+      <div class="button-grid">
+        <button class="button small" data-mirror="x" title="Mirror across X">X</button>
+        <button class="button small" data-mirror="y" title="Mirror across Y">Y</button>
+        <button class="button small" data-mirror="z" title="Mirror across Z">Z</button>
+      </div>
+      <div class="button-grid two">
+        <button id="centre-button" class="button small">Centre</button>
+        <button id="drop-button" class="button small">Drop to plate</button>
+      </div>
+      <div class="field-row">
+        <label class="field">
+          <span>Build plate (mm)</span>
+          <input id="plate-input" class="input" type="number" value="220" min="20" step="10">
+        </label>
+      </div>
+    </section>
+
+    <section class="panel-section">
+      <h2 class="section-title">View</h2>
+      <div class="button-grid views">
+        <button class="button small" data-view="iso">Iso</button>
+        <button class="button small" data-view="front">Front</button>
+        <button class="button small" data-view="top">Top</button>
+        <button class="button small" data-view="right">Right</button>
+      </div>
+      <label class="checkbox"><input type="checkbox" id="toggle-ghost" checked> Fade other parts when one is selected</label>
+      <label class="checkbox"><input type="checkbox" id="toggle-wireframe"> Wireframe</label>
+      <label class="checkbox"><input type="checkbox" id="toggle-backfaces" checked> Flag back faces in red</label>
+      <button id="fit-button" class="button small wide">Fit view</button>
+    </section>
+  </aside>
+
+  <section class="viewport" id="viewport">
+    <canvas id="canvas"></canvas>
+
+    <div class="dropzone" id="dropzone">
+      <div class="dropzone-inner">
+        <h1>Drop a model here</h1>
+        <p>STL, 3MF, OBJ or PLY — nothing leaves your computer.</p>
+        <button class="button primary" id="dropzone-button">Choose a file</button>
+        <p class="muted small demo-line">
+          No file handy? <button class="link" id="demo-button">Load a broken test model</button>
+        </p>
+      </div>
+    </div>
+
+    <div class="legend" id="legend" hidden>
+      <label class="legend-item"><input type="checkbox" data-highlight="boundary" checked><span class="swatch swatch-boundary"></span>Open edges <em id="count-boundary">0</em></label>
+      <label class="legend-item"><input type="checkbox" data-highlight="nonManifold" checked><span class="swatch swatch-nonmanifold"></span>Non-manifold <em id="count-nonmanifold">0</em></label>
+      <label class="legend-item"><input type="checkbox" data-highlight="flipped" checked><span class="swatch swatch-flipped"></span>Flipped <em id="count-flipped">0</em></label>
+      <label class="legend-item"><input type="checkbox" data-highlight="intersecting" checked><span class="swatch swatch-intersecting"></span>Intersecting <em id="count-intersecting">0</em></label>
+    </div>
+
+    <div class="busy" id="busy" hidden>
+      <div class="busy-card">
+        <div class="spinner" aria-hidden="true"></div>
+        <p id="busy-label">Working…</p>
+        <div class="bar"><div class="bar-fill" id="busy-bar"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="panel panel-right">
+    <section class="panel-section" id="diagnosis-section" hidden>
+      <h2 class="section-title">Diagnosis</h2>
+      <div id="verdict" class="verdict"></div>
+      <ul id="problem-list" class="problem-list"></ul>
+      <button id="scan-intersections" class="button small wide">Also check for self-intersections</button>
+    </section>
+
+    <section class="panel-section" id="repair-section" hidden>
+      <h2 class="section-title">Repair</h2>
+      <button id="repair-button" class="button primary wide large">Repair everything</button>
+      <p class="muted small">Welds vertices, removes junk triangles, separates pinched geometry, fixes winding and fills every hole.</p>
+      <button id="rebuild-button" class="button wide" hidden>Rebuild as a solid <span class="tag alt">experimental</span></button>
+      <p class="muted small" id="rebuild-offer" hidden></p>
+
+      <details class="options" id="repair-options">
+        <summary>Choose individual fixes</summary>
+        <div class="options-body">
+          <label class="checkbox"><input type="checkbox" data-option="weld" checked> Weld vertices at the same position</label>
+          <label class="field indent">
+            <span>Tolerance</span>
+            <input id="tolerance-input" class="input" type="text" placeholder="auto">
+          </label>
+          <label class="checkbox"><input type="checkbox" data-option="removeDegenerate" checked> Remove zero-area triangles</label>
+          <label class="checkbox"><input type="checkbox" data-option="removeDuplicates" checked> Remove duplicate faces</label>
+          <label class="checkbox"><input type="checkbox" data-option="removeOppositeDuplicates" checked> …including zero-thickness fins</label>
+          <label class="checkbox"><input type="checkbox" data-option="splitNonManifold" checked> Separate pinched (non-manifold) geometry</label>
+          <label class="checkbox"><input type="checkbox" data-option="removeDebris" checked> Discard stray shells</label>
+          <label class="checkbox indent"><input type="checkbox" data-option="keepLargestOnly"> Keep only the largest body</label>
+          <label class="checkbox"><input type="checkbox" data-option="fixWinding" checked> Make winding consistent</label>
+          <label class="checkbox"><input type="checkbox" data-option="fillHoles" checked> Fill holes</label>
+          <label class="checkbox"><input type="checkbox" data-option="outwardNormals" checked> Point normals outwards</label>
+          <label class="checkbox danger"><input type="checkbox" data-option="fixSelfIntersections"> Cut out self-intersections <span class="tag">destructive</span></label>
+          <p class="muted small">Cuts out the triangles that pass through each other and re-closes the gap. Surgical: it only touches a body crossing itself, and leaves the rest of the model exactly as it is.</p>
+
+          <div class="experimental">
+            <h3 class="experimental-title">Experimental</h3>
+            <label class="checkbox"><input type="checkbox" data-option="rebuildAsSolid"> Rebuild as a solid <span class="tag alt">experimental</span></label>
+            <label class="field indent">
+              <span>Detail</span>
+              <select id="rebuild-resolution" class="select">
+                <option value="96">Coarse — quickest</option>
+                <option value="160" selected>Normal</option>
+                <option value="240">Fine</option>
+                <option value="320">Very fine — slow, big files</option>
+              </select>
+            </label>
+            <p class="muted small" id="rebuild-hint">Re-derives the surface from scratch instead of editing it. Fixes intersections that cannot be edited away, and merges overlapping bodies into one solid. Every detail is resampled, so sharp edges soften and the triangle count goes up a lot.</p>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <section class="panel-section" id="report-section" hidden>
+      <h2 class="section-title">What changed</h2>
+      <table class="compare" id="compare-table"></table>
+      <ul id="repair-log" class="log"></ul>
+    </section>
+
+    <section class="panel-section" id="stats-section" hidden>
+      <h2 class="section-title">Model</h2>
+      <dl class="facts" id="stats-facts"></dl>
+    </section>
+  </aside>
+</main>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

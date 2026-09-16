@@ -1,0 +1,14 @@
+# For running it with Compose, locally or in Coolify's Docker Compose build
+# pack. The Dockerfile build pack is simpler if you just want it deployed.
+services:
+  mesh-mender:
+    build: .
+    ports:
+      - "8173:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

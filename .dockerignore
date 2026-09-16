@@ -1,0 +1,13 @@
+.git
+.gitignore
+.DS_Store
+node_modules
+test
+docs
+*.md
+serve.sh
+start.command
+package.json
+Dockerfile
+.dockerignore
+docker-compose.yml

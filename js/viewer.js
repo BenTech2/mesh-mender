@@ -386,6 +386,58 @@ export class Viewer {
     this.scene.add(this.selectionMarker);
   }
 
+  /**
+   * Show where a cut would fall.
+   *
+   * A number in a box is a poor way to aim a saw at a shape you are looking at,
+   * so the plane is drawn in place, sized to the model and outlined so it reads
+   * as a cut rather than a wall.
+   */
+  showCutPlane(axis, position, box) {
+    this.hideCutPlane();
+    if (!box) return;
+    const size = box.getSize(new THREE.Vector3());
+    const centre = box.getCenter(new THREE.Vector3());
+    const margin = Math.max(size.x, size.y, size.z) * 0.12 + 1;
+    const dims = [size.x + margin * 2, size.y + margin * 2, size.z + margin * 2];
+    const u = (axis + 1) % 3, v = (axis + 2) % 3;
+
+    const group = new THREE.Group();
+    const geometry = new THREE.PlaneGeometry(dims[u], dims[v]);
+    const plane = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+      color: 0x4da3ff, transparent: true, opacity: 0.16,
+      side: THREE.DoubleSide, depthWrite: false,
+    }));
+    const outline = new THREE.LineSegments(
+      new THREE.EdgesGeometry(geometry),
+      new THREE.LineBasicMaterial({ color: 0x7fc0ff, transparent: true, opacity: 0.9, depthTest: false }),
+    );
+    outline.renderOrder = 21;
+    group.add(plane, outline);
+
+    // PlaneGeometry lies in XY; turn it to face along the chosen axis.
+    if (axis === 0) group.rotation.set(0, Math.PI / 2, Math.PI / 2);
+    else if (axis === 1) group.rotation.set(Math.PI / 2, 0, Math.PI / 2);
+
+    const at = [centre.x, centre.y, centre.z];
+    at[axis] = position;
+    group.position.set(at[0], at[1], at[2]);
+    group.renderOrder = 20;
+
+    this.cutPlane = group;
+    this.scene.add(group);
+  }
+
+  hideCutPlane() {
+    if (!this.cutPlane) return;
+    this.scene.remove(this.cutPlane);
+    this.cutPlane.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+    this.cutPlane = null;
+  }
+
   /** Bounding box of one model, or null if it is not loaded or hidden. */
   boundsOfModel(id) {
     const entry = this.models.get(id);

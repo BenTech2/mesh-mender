@@ -135,11 +135,52 @@ picked. *Fade other parts when one is selected* turns that off.
 Everything in the right-hand panel — the diagnosis, the measurements, repair,
 and saving — applies to the selected part alone.
 
+## Laying a model flat
+
+**Lay flat** turns the model onto a face it can actually rest on and sets it
+down on the plate. Press it again to try the next-largest face — which way up a
+model "should" go is a judgement, and the biggest flat face is a good guess
+rather than an answer. Both are undoable.
+
+The candidates come from the model's *convex hull*, not from its own triangles.
+That distinction does the work: a tripod rests on three feet that share no
+triangle, and a sphere's mesh has thousands of faces it could never balance on.
+A hull face only counts as a resting position if the model's centre of mass
+falls over the patch it would touch — otherwise it topples — and the usable
+candidates are then ranked by how much of the model ends up against the bed,
+because that is what decides whether a print stays stuck down.
+
+A shape with no flat face at all still gets set down on the closest thing to
+one, and says so rather than offering to step through six hundred near-identical
+options.
+
+## Splitting a model
+
+Pick **X**, **Y** or **Z**, slide the plane to where you want the cut — it is
+drawn in the viewport, because a number in a box is a poor way to aim a saw at a
+shape you are looking at — and press **Cut into two**. The halves replace the
+original in the model list, and the whole thing undoes in one step.
+
+Both halves are **capped** where the plane passes through, so each one comes out
+as a closed solid rather than an open shell. The cap is not simply a disc: cut a
+hollow tube and the right answer is a ring, so the cut outline is assembled into
+loops, the loops are sorted into outlines and the holes inside them, and each
+outline is triangulated with its holes bridged in. Nothing is created or
+destroyed — the two halves' volumes add up to the original's exactly.
+
+Cutting a model whose walls already pass through each other has no single
+cross-section to follow. The cut still happens, but the app says how many edges
+it could not close, so you can repair first and cut again.
+
 ## Getting it onto the plate
 
 Units, scale, 90° rotations, mirroring, centring and dropping to the plate are
-in the left panel, along with the build-plate size. `Ctrl/Cmd+Z` undoes, and
-every repair and transform is undoable.
+in the left panel, along with the build-plate size.
+
+`Ctrl/Cmd+Z` undoes. Everything goes on one undo stack — repairs, transforms,
+lay flat, splitting and separating alike — because editing a mesh and cutting
+one in two are different shapes of change but they share an order, and a
+per-model history cannot express "undo the split".
 
 ## Deploying it
 
@@ -200,6 +241,9 @@ js/mesh/            the repair library, free of any DOM dependency
   holes.js          hole filling
   nonmanifold.js    fan splitting
   shells.js         separate bodies and debris
+  hull.js           3D convex hull, by quickhull
+  layflat.js        resting orientations and the turn onto one
+  split.js          plane cutting, with capped cross-sections
   bvh.js            bounding-volume hierarchy
   intersect.js      triangle-triangle intersection and the search over it
   analyze.js        the read-only diagnosis

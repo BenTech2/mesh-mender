@@ -223,7 +223,7 @@ body {
 
 /* ---------- model list ---------- */
 
-.model-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; }
+.model-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; }
 .model-item {
   display: flex; align-items: center; gap: 7px;
   padding: 7px 8px;
@@ -231,11 +231,15 @@ body {
   border-radius: var(--radius);
   background: var(--panel-2);
   cursor: pointer;
+  /* Without this the row refuses to shrink below its own text: a grid item's
+     minimum size is its content, so a long model name pushes the count and the
+     close button off the side of the panel instead of being ellipsised. */
+  min-width: 0;
 }
 .model-item:hover { border-color: #2d3d4f; }
 .model-item.selected { border-color: var(--accent); background: #162434; }
 .model-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.model-item .count { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+.model-item .count { font-family: var(--mono); font-size: 11px; color: var(--text-faint); flex: none; }
 .model-item .eye, .model-item .close {
   background: none; border: 0; color: var(--text-faint); cursor: pointer;
   padding: 2px 4px; border-radius: 4px; font-size: 12px; line-height: 1;
@@ -359,6 +363,23 @@ body {
   border-color: #4a3160;
 }
 #rebuild-button { margin-top: 8px; display: flex; align-items: center; justify-content: center; gap: 7px; }
+
+.button.axis.selected {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 650;
+}
+
+.slider {
+  width: 100%;
+  margin: 10px 0 2px;
+  accent-color: var(--accent);
+  background: transparent;
+}
+
+#layflat-button { margin-top: 9px; }
+#layflat-note { margin-top: 6px; }
 
 /* ---------- toasts ---------- */
 

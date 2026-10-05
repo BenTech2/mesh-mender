@@ -85,12 +85,34 @@
         <button id="centre-button" class="button small">Centre</button>
         <button id="drop-button" class="button small">Drop to plate</button>
       </div>
+      <button id="layflat-button" class="button small wide" title="Turn the model onto a face it can rest on, and set it on the plate">Lay flat</button>
+      <p class="muted small" id="layflat-note" hidden></p>
       <div class="field-row">
         <label class="field">
           <span>Build plate (mm)</span>
           <input id="plate-input" class="input" type="number" value="220" min="20" step="10">
         </label>
       </div>
+    </section>
+
+    <section class="panel-section" id="split-section" hidden>
+      <h2 class="section-title">Split</h2>
+      <p class="control-label">Cut across</p>
+      <div class="button-grid">
+        <button class="button small axis" data-split-axis="0">X</button>
+        <button class="button small axis" data-split-axis="1">Y</button>
+        <button class="button small axis selected" data-split-axis="2">Z</button>
+      </div>
+      <input id="split-slider" class="slider" type="range" min="0" max="1000" value="500" aria-label="Cut position">
+      <div class="field-row">
+        <label class="field">
+          <span>Cut at (mm)</span>
+          <input id="split-position" class="input" type="number" step="0.5">
+        </label>
+        <button id="split-middle" class="button small" title="Put the cut through the middle">Middle</button>
+      </div>
+      <button id="split-button" class="button wide">Cut into two</button>
+      <p class="muted small">Both halves are capped where the cut passes through, so each one comes out as a closed solid you can print.</p>
     </section>
 
     <section class="panel-section">

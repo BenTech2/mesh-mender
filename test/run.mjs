@@ -16,6 +16,9 @@ import { findSelfIntersections, classifyIntersections, triTriIntersect } from '.
 import { analyze, collectHighlights } from '../js/mesh/analyze.js';
 import { repair } from '../js/mesh/repair.js';
 import { rebuildAsSolid, planGrid } from '../js/mesh/voxel.js';
+import { convexHull } from '../js/mesh/hull.js';
+import { layFlatTransform, restingCandidates, volumeCentroid, convexHull2D } from '../js/mesh/layflat.js';
+import { splitByPlane } from '../js/mesh/split.js';
 import { loadFile, exportMeshes, EXPORT_FORMATS } from '../js/io/index.js';
 import { parseModelXML } from '../js/io/threemf.js';
 import {
@@ -542,6 +545,231 @@ test('rebuilding is off unless asked for', () => {
   const r = repair(cubeSoup(20), {});
   equal(r.log.filter((e) => e.step === 'Rebuild as a solid').length, 0, 'no rebuild step ran');
   equal(r.after.triangles, 12, 'the original triangles are untouched');
+});
+
+/* ------------------------------------------------------------- convex hull */
+
+/** Volume enclosed by a set of hull faces, for checking the hull is right. */
+function hullVolume(positions, faces) {
+  let volume = 0;
+  for (const [i, j, k] of faces) {
+    const a = i * 3, b = j * 3, c = k * 3;
+    volume += positions[a] * (positions[b + 1] * positions[c + 2] - positions[b + 2] * positions[c + 1])
+            - positions[a + 1] * (positions[b] * positions[c + 2] - positions[b + 2] * positions[c])
+            + positions[a + 2] * (positions[b] * positions[c + 1] - positions[b + 1] * positions[c]);
+  }
+  return volume / 6;
+}
+
+test('the convex hull of a cube is the cube', () => {
+  const m = cube(10);
+  const hull = convexHull(m.positions);
+  equal(hull.faces.length, 12, 'twelve triangles');
+  equal(hull.used.size, 8, 'eight corners');
+  close(hullVolume(m.positions, hull.faces), 1000, 1e-9, 'volume');
+});
+
+test('the hull ignores points inside it', () => {
+  const positions = new Float64Array([0, 0, 0, 10, 0, 0, 0, 10, 0, 0, 0, 10, 1, 1, 1, 2, 2, 2]);
+  const hull = convexHull(positions);
+  equal(hull.faces.length, 4, 'a tetrahedron');
+  assert(!hull.used.has(4) && !hull.used.has(5), 'interior points left out');
+  close(hullVolume(positions, hull.faces), 1000 / 6, 1e-9, 'volume');
+});
+
+test('the hull of a convex mesh encloses the same volume as the mesh', () => {
+  const m = Cleanup.weldVertices(sphere(30, 30, 10), 1e-9).mesh;
+  const hull = convexHull(m.positions);
+  close(hullVolume(m.positions, hull.faces), m.signedVolume(), m.signedVolume() * 1e-6, 'volume');
+});
+
+test('a flat sheet of points has no hull volume and says so', () => {
+  const positions = new Float64Array([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]);
+  const hull = convexHull(positions);
+  equal(hull.faces.length, 0, 'no hull');
+});
+
+/* ---------------------------------------------------------------- lay flat */
+
+/** Turn a mesh about the origin, to give lay flat something to undo. */
+function tilt(mesh, ax, ay, az) {
+  const apply = (R, v) => [
+    R[0] * v[0] + R[1] * v[1] + R[2] * v[2],
+    R[3] * v[0] + R[4] * v[1] + R[5] * v[2],
+    R[6] * v[0] + R[7] * v[1] + R[8] * v[2],
+  ];
+  const rx = [1, 0, 0, 0, Math.cos(ax), -Math.sin(ax), 0, Math.sin(ax), Math.cos(ax)];
+  const ry = [Math.cos(ay), 0, Math.sin(ay), 0, 1, 0, -Math.sin(ay), 0, Math.cos(ay)];
+  const rz = [Math.cos(az), -Math.sin(az), 0, Math.sin(az), Math.cos(az), 0, 0, 0, 1];
+  const p = mesh.positions;
+  for (let i = 0; i < p.length; i += 3) {
+    let v = [p[i], p[i + 1], p[i + 2]];
+    v = apply(rx, v); v = apply(ry, v); v = apply(rz, v);
+    p[i] = v[0]; p[i + 1] = v[1]; p[i + 2] = v[2];
+  }
+  return mesh;
+}
+
+function box(w, d, h) {
+  const positions = [0, 0, 0, w, 0, 0, w, d, 0, 0, d, 0, 0, 0, h, w, 0, h, w, d, h, 0, d, h];
+  return new Mesh(new Float64Array(positions), new Uint32Array(CUBE_INDICES));
+}
+
+test('the centre of mass of a solid is its volume centroid', () => {
+  const centre = volumeCentroid(cube(10));
+  for (let k = 0; k < 3; k++) close(centre[k], 5, 1e-9, `axis ${k}`);
+  // A box twice as long sits with its centre halfway along, not at the corner.
+  const centre2 = volumeCentroid(box(40, 10, 10));
+  close(centre2[0], 20, 1e-9, 'long axis');
+});
+
+test('convexHull2D wraps a point cloud', () => {
+  const hull = convexHull2D([[0, 0], [2, 0], [2, 2], [0, 2], [1, 1], [1, 0.5]]);
+  equal(hull.length, 4, 'a square, interior points dropped');
+});
+
+test('a tilted box is laid back down flat', () => {
+  for (const [w, d, h] of [[10, 10, 10], [40, 30, 5], [5, 5, 50], [60, 8, 8]]) {
+    const m = tilt(box(w, d, h), 0.6, 0.9, 0.3);
+    const before = m.signedVolume();
+    const result = layFlatTransform(m);
+    assert(result !== null, 'found a resting face');
+    m.applyMatrix4(result.matrix);
+    const bounds = m.bounds();
+
+    // Resting on a face means the model's height is one of its own dimensions,
+    // and it sits exactly on the plate.
+    const sides = [w, d, h].sort((a, b) => a - b);
+    assert(sides.some((s) => Math.abs(bounds.size[2] - s) < 1e-6),
+      `height ${bounds.size[2]} is one of ${sides.join('/')}`);
+    close(bounds.min[2], 0, 1e-9, 'sits on the plate');
+    close(m.signedVolume(), before, Math.abs(before) * 1e-9, 'volume unchanged — it only turned');
+    assert(result.candidate.stable, 'the chosen face is stable');
+  }
+});
+
+test('lay flat puts the largest face down', () => {
+  // A slab should end up lying on its 40x30 face, 5 tall — not on an edge.
+  const m = tilt(box(40, 30, 5), 1.1, 0.4, 0.8);
+  const result = layFlatTransform(m);
+  m.applyMatrix4(result.matrix);
+  close(m.bounds().size[2], 5, 1e-6, 'resting on the broad face');
+  close(result.candidate.contactArea, 1200, 1e-6, 'contact patch is 40 x 30');
+});
+
+test('lay flat offers alternatives, and they differ', () => {
+  const m = box(40, 30, 5);
+  const candidates = restingCandidates(m);
+  assert(candidates.length >= 3, `several resting faces (${candidates.length})`);
+  assert(candidates[0].contactArea >= candidates[1].contactArea, 'best first');
+
+  const first = layFlatTransform(m, 0);
+  const second = layFlatTransform(m, 1);
+  const differs = first.matrix.some((value, i) => Math.abs(value - second.matrix[i]) > 1e-9);
+  assert(differs, 'asking for the next face gives a different orientation');
+});
+
+test('lay flat copes with a shape that has no flat face', () => {
+  const m = Cleanup.weldVertices(sphere(24, 24, 10), 1e-9).mesh;
+  const before = m.signedVolume();
+  const result = layFlatTransform(m);
+  assert(result !== null, 'still returns an orientation');
+  m.applyMatrix4(result.matrix);
+  close(m.bounds().min[2], 0, 1e-6, 'sits on the plate');
+  close(m.signedVolume(), before, Math.abs(before) * 1e-9, 'volume unchanged');
+});
+
+/* ------------------------------------------------------------------- split */
+
+function splitIsClean(mesh, axis, position, message) {
+  const whole = analyze(mesh);
+  const result = splitByPlane(mesh, axis, position);
+  const halves = [result.below, result.above].filter((m) => m.triangleCount > 0);
+  equal(halves.length, 2, `${message}: cut into two`);
+
+  let total = 0;
+  for (const half of halves) {
+    const report = analyze(half);
+    assert(report.watertight, `${message}: half is watertight`);
+    assert(report.manifold, `${message}: half is manifold`);
+    assert(report.oriented, `${message}: half is consistently wound`);
+    assert(report.volume > 0, `${message}: half has positive volume`);
+    total += report.volume;
+  }
+  // Nothing is created or destroyed by a cut.
+  close(total, whole.volume, Math.abs(whole.volume) * 1e-9, `${message}: volume conserved`);
+  return result;
+}
+
+test('a cube splits cleanly on every axis', () => {
+  for (const axis of [0, 1, 2]) {
+    for (const position of [4, 10, 17.5]) {
+      splitIsClean(cube(20), axis, position, `cube axis ${axis} at ${position}`);
+    }
+  }
+});
+
+test('a sphere splits cleanly, even from unwelded input', () => {
+  splitIsClean(sphere(40, 40, 15), 2, 0, 'sphere soup through the middle');
+  splitIsClean(sphere(40, 40, 15), 1, 7, 'sphere soup off-centre');
+  splitIsClean(Cleanup.weldVertices(sphere(40, 40, 15), 1e-9).mesh, 0, -3, 'welded sphere');
+});
+
+test('cutting a hollow tube caps it as a ring, not a plug', () => {
+  const R = 20, r = 12, height = 40, segments = 48;
+  const ring = (radius, z) => Array.from({ length: segments }, (_, i) => {
+    const a = (i / segments) * Math.PI * 2;
+    return [radius * Math.cos(a), radius * Math.sin(a), z];
+  });
+  const ob = ring(R, 0), ot = ring(R, height), ib = ring(r, 0), it = ring(r, height);
+  const tris = [];
+  for (let i = 0; i < segments; i++) {
+    const j = (i + 1) % segments;
+    tris.push([ob[i], ob[j], ot[j]], [ob[i], ot[j], ot[i]]);
+    tris.push([ib[j], ib[i], it[i]], [ib[j], it[i], it[j]]);
+    tris.push([ob[j], ob[i], ib[i]], [ob[j], ib[i], ib[j]]);
+    tris.push([ot[i], ot[j], it[j]], [ot[i], it[j], it[i]]);
+  }
+  const tube = Cleanup.weldVertices(meshFromTriangles(tris), 1e-9).mesh;
+
+  const result = splitIsClean(tube, 2, 18, 'tube across');
+  // A plugged cap would swallow the bore; the ring's area gives it away.
+  const annulus = Math.PI * (R * R - r * r);
+  assert(Math.abs(result.crossSectionArea - annulus) / annulus < 0.02,
+    `cut face is a ring of ~${annulus.toFixed(0)} mm² (got ${result.crossSectionArea.toFixed(0)})`);
+  splitIsClean(tube, 0, 0, 'tube lengthwise');
+});
+
+test('splitting two separate bodies at once keeps both closed', () => {
+  const a = cube(10), b = cube(10, [30, 0, 0]);
+  const pair = new Mesh(
+    new Float64Array([...a.positions, ...b.positions]),
+    new Uint32Array([...a.indices, ...Array.from(b.indices, (i) => i + 8)]),
+  );
+  const result = splitIsClean(pair, 2, 5, 'two cubes cut through both');
+  equal(analyze(result.below).shellCount, 2, 'lower half still has two bodies');
+});
+
+test('a plane that misses the model leaves it whole', () => {
+  const result = splitByPlane(cube(20), 2, 50);
+  equal(result.above.triangleCount, 0, 'nothing above');
+  equal(result.below.triangleCount, 12, 'everything below, untouched');
+  close(result.below.signedVolume(), 8000, 1e-9);
+});
+
+test('a cut exactly along a face does not slice off a sliver', () => {
+  const result = splitByPlane(cube(20), 2, 20);
+  equal(result.above.triangleCount, 0, 'nothing above the top face');
+  close(result.below.signedVolume(), 8000, 1e-9, 'volume intact');
+});
+
+test('split reports when it could not close the cut', () => {
+  // Two bodies sharing space have no single cross-section outline to follow.
+  const tangled = Cleanup.weldVertices(meshFromTriangles(
+    sphereTriangles(24, 24, 15).concat(sphereTriangles(24, 24, 15, [18, 0, 0])),
+  ), 1e-9).mesh;
+  const result = splitByPlane(tangled, 2, 0);
+  assert(result.leftOpen > 0, 'admits the halves are not closed');
 });
 
 /* ------------------------------------------------------------------ files */

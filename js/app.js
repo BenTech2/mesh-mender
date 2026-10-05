@@ -47,7 +47,18 @@ const state = {
   models: new Map(),
   selectedId: null,
   busyDepth: 0,
+  // Undo is a single stack in the worker, covering edits and splits alike.
+  history: { canUndo: false, canRedo: false },
+  layFlatIndex: 0,
+  split: { axis: 2, position: null },
 };
+
+/** Every mutating reply carries the history state; keep the buttons in step. */
+function noteHistory(payload) {
+  if (payload && payload.history) state.history = payload.history;
+  $('undo-button').disabled = !state.history.canUndo;
+  $('redo-button').disabled = !state.history.canRedo;
+}
 
 const worker = new WorkerClient(new URL('./worker.js', import.meta.url));
 const viewer = new Viewer(document.getElementById('canvas'));
@@ -107,6 +118,10 @@ const count = (n) => nf.format(n);
 function dimension(mm) {
   if (!Number.isFinite(mm)) return '—';
   const abs = Math.abs(mm);
+  // Rotating a model leaves its resting height at something like 4e-15 rather
+  // than 0. That is zero for every purpose anyone has here, and printing it in
+  // scientific notation just looks like a fault.
+  if (abs < 1e-6) return '0.00 mm';
   if (abs >= 1000) return `${(mm / 10).toFixed(1)} cm`;
   if (abs >= 1) return `${mm.toFixed(2)} mm`;
   return `${mm.toPrecision(3)} mm`;
@@ -200,6 +215,13 @@ function renderModelList() {
  *   would yank the view around while they were reading the result.
  */
 async function selectModel(id, { frame = false } = {}) {
+  if (id !== state.selectedId) {
+    // The cut position and the lay-flat sequence belong to the model they were
+    // set on; carrying them to another one aims the saw somewhere arbitrary.
+    state.split.position = null;
+    state.layFlatIndex = 0;
+    $('layflat-note').hidden = true;
+  }
   state.selectedId = id;
   renderModelList();
   if (frame) viewer.frameModel(id);
@@ -233,12 +255,12 @@ async function refreshSelection() {
     : 'Re-derives the surface from scratch. The heavy option: it always returns a watertight, '
       + 'manifold solid, and merges overlapping bodies — but it resamples every detail, so edges '
       + 'soften and the triangle count climbs steeply.';
-  $('undo-button').disabled = !model?.canUndo;
-  $('redo-button').disabled = !model?.canRedo;
+  noteHistory(null);
+  $('split-section').hidden = !has;
   $('report-section').hidden = !model?.lastReport;
 
   viewer.setSelected(state.selectedId);
-  if (!model) return;
+  if (!model) { viewer.hideCutPlane(); return; }
   if (!model.analysis) {
     await analyseModel(model.id, false);
     return;
@@ -246,6 +268,7 @@ async function refreshSelection() {
   renderDiagnosis(model.analysis);
   renderStats(model);
   updateRebuildHint();
+  refreshSplitControls();
   if (model.lastReport) renderReport(model.lastReport);
   $('unit-select').value = UNIT_TO_MM[model.unit] ? model.unit : 'millimeter';
   await refreshHighlights();
@@ -414,6 +437,8 @@ async function runRepair(overrides = {}) {
     const updated = adoptModel(result.model);
     updated.analysis = result.after;
     updated.lastReport = { before: result.before, after: result.after, log: result.log };
+    noteHistory(result);
+    state.layFlatIndex = 0;
     renderModelList();
     await refreshSelection();
 
@@ -558,6 +583,25 @@ async function exportSelected() {
   }
 }
 
+/** Take in the result of an operation that swapped one model for several. */
+function adoptStructural(result, format) {
+  noteHistory(result);
+  for (const id of result.removed ? [].concat(result.removed) : []) {
+    viewer.removeModel(id);
+    state.models.delete(id);
+  }
+  let firstId = null;
+  for (const payload of result.models) {
+    const part = adoptModel(payload);
+    part.format = format;
+    part.visible = true;
+    if (!firstId) firstId = part.id;
+  }
+  state.layFlatIndex = 0;
+  renderModelList();
+  return firstId;
+}
+
 /* -------------------------------------------------------------- transforms */
 
 function identity() {
@@ -592,11 +636,132 @@ async function applyTransform(matrix, label = 'Moving…') {
   try {
     const result = await worker.request('transform', { id: model.id, matrix });
     adoptModel(result.model);
+    noteHistory(result);
+    state.layFlatIndex = 0;
     const fresh = await worker.request('analyze', { id: model.id, checkSelfIntersections: false });
     state.models.get(model.id).analysis = fresh.analysis;
     renderModelList();
     await refreshSelection();
     fitPlateToModels();
+  } catch (error) {
+    toast('error', error.message);
+  } finally {
+    busy(false);
+  }
+}
+
+/* ------------------------------------------------------------- lay flat */
+
+async function runLayFlat() {
+  const model = selected();
+  if (!model) return;
+  busy(true, 'Finding a face to rest on…');
+  try {
+    const result = await worker.request('layflat', { id: model.id, index: state.layFlatIndex });
+    if (!result.applied) { toast('info', result.reason); return; }
+
+    adoptModel(result.model);
+    noteHistory(result);
+    const fresh = await worker.request('analyze', { id: model.id, checkSelfIntersections: false });
+    state.models.get(model.id).analysis = fresh.analysis;
+    renderModelList();
+    await refreshSelection();
+    fitPlateToModels();
+
+    // Keep offering the next-best face: which way up a model "should" go is a
+    // judgement, and the largest flat face is a good guess rather than an
+    // answer. Pressing again tries the next one down.
+    state.layFlatIndex = result.index + 1;
+
+    // A rounded shape has no flat face; it has thousands of tiny ones and rests
+    // on whichever it was left touching. Offering to step through 510 of them
+    // would be worse than useless, so say what actually happened instead.
+    const bounds = state.models.get(model.id).analysis.bounds;
+    const footprint = Math.max(bounds.size[0] * bounds.size[1], 1);
+    const note = $('layflat-note');
+    note.hidden = false;
+    if (result.contactArea < footprint * 0.02) {
+      note.textContent = 'This shape has no flat face to stand on, so it was set down on the '
+        + 'closest thing to one. Press again to try another.';
+    } else if (result.candidates > 1) {
+      note.textContent = `Resting on a face of ${Math.round(result.contactArea)} mm². `
+        + 'Press again to try the next-largest face.';
+    } else {
+      note.textContent = `Resting on a face of ${Math.round(result.contactArea)} mm².`;
+    }
+    if (!result.stable) {
+      toast('info', 'That is the flattest face available, but the model is top-heavy on it and may topple.');
+    }
+  } catch (error) {
+    toast('error', error.message);
+  } finally {
+    busy(false);
+  }
+}
+
+/* ----------------------------------------------------------------- split */
+
+/** The model's extent along the current split axis. */
+function splitRange() {
+  const model = selected();
+  if (!model?.analysis) return null;
+  const b = model.analysis.bounds;
+  const axis = state.split.axis;
+  return { min: b.min[axis], max: b.max[axis], centre: b.center[axis] };
+}
+
+function refreshSplitControls({ resetPosition = false } = {}) {
+  const range = splitRange();
+  const section = $('split-section');
+  if (!range) { section.hidden = true; viewer.hideCutPlane(); return; }
+  section.hidden = false;
+
+  if (resetPosition || state.split.position === null
+      || state.split.position < range.min || state.split.position > range.max) {
+    state.split.position = range.centre;
+  }
+
+  for (const button of document.querySelectorAll('[data-split-axis]')) {
+    button.classList.toggle('selected', Number(button.dataset.splitAxis) === state.split.axis);
+  }
+
+  const span = range.max - range.min;
+  const slider = $('split-slider');
+  slider.value = span > 0 ? String(Math.round(((state.split.position - range.min) / span) * 1000)) : '500';
+  $('split-position').value = Number(state.split.position.toFixed(3));
+  $('split-position').min = Number(range.min.toFixed(3));
+  $('split-position').max = Number(range.max.toFixed(3));
+
+  const model = selected();
+  viewer.showCutPlane(state.split.axis, state.split.position, viewer.boundsOfModel(model.id));
+}
+
+async function runSplit() {
+  const model = selected();
+  const range = splitRange();
+  if (!model || !range) return;
+  if (state.split.position <= range.min || state.split.position >= range.max) {
+    toast('info', 'That cut falls outside the model. Move it between the ends.');
+    return;
+  }
+  busy(true, 'Cutting…');
+  try {
+    const result = await worker.request('split', {
+      id: model.id, axis: state.split.axis, position: state.split.position,
+    });
+    if (!result.applied) { toast('info', result.reason); return; }
+
+    viewer.hideCutPlane();
+    const firstId = adoptStructural(result, model.format);
+    await selectModel(firstId, { frame: true });
+    fitPlateToModels();
+
+    const axisName = ['X', 'Y', 'Z'][result.axis];
+    if (result.leftOpen > 0) {
+      toast('info', `Cut along ${axisName}, but ${result.leftOpen} edges could not be capped — repair the model and cut again for a closed result.`);
+    } else {
+      toast('success', `Cut along ${axisName}. Both halves are closed; the cut face is ${(result.crossSectionArea / 100).toFixed(2)} cm².`);
+    }
   } catch (error) {
     toast('error', error.message);
   } finally {
@@ -661,16 +826,7 @@ $('separate-button').addEventListener('click', async () => {
   try {
     const result = await worker.request('separate', { id: model.id });
     if (!result.models.length) { toast('info', result.reason); return; }
-    viewer.removeModel(result.removed);
-    state.models.delete(result.removed);
-    let firstId = null;
-    for (const payload of result.models) {
-      const part = adoptModel(payload);
-      part.format = model.format;
-      part.visible = true;
-      if (!firstId) firstId = part.id;
-    }
-    renderModelList();
+    const firstId = adoptStructural(result, model.format);
     await selectModel(firstId, { frame: true });
     toast('success', `Split into ${result.models.length} separate bodies. Pick one from the list to bring it into view.`);
   } catch (error) {
@@ -695,29 +851,47 @@ $('scan-intersections').addEventListener('click', () => {
   if (model) analyseModel(model.id, true);
 });
 
-$('undo-button').addEventListener('click', async () => {
-  const model = selected();
-  if (!model) return;
+async function stepHistory(direction) {
   try {
-    const result = await worker.request('undo', { id: model.id });
-    const updated = adoptModel(result.model);
-    updated.analysis = result.analysis;
-    renderModelList();
-    await refreshSelection();
-  } catch (error) { toast('info', error.message); }
-});
+    const result = await worker.request(direction, {});
+    applyHistoryStep(result);
+  } catch (error) {
+    toast('info', error.message);
+  }
+}
 
-$('redo-button').addEventListener('click', async () => {
-  const model = selected();
-  if (!model) return;
-  try {
-    const result = await worker.request('redo', { id: model.id });
-    const updated = adoptModel(result.model);
-    updated.analysis = result.analysis;
-    renderModelList();
-    await refreshSelection();
-  } catch (error) { toast('info', error.message); }
-});
+/** A history step either restores one model's geometry or swaps models around. */
+async function applyHistoryStep(result) {
+  noteHistory(result);
+  if (result.kind === 'mesh') {
+    const model = adoptModel(result.model);
+    model.analysis = result.analysis;
+    delete model.lastReport;
+    state.selectedId = model.id;
+  } else {
+    for (const id of result.removed) {
+      viewer.removeModel(id);
+      state.models.delete(id);
+    }
+    let firstId = null;
+    for (const payload of result.models) {
+      const model = adoptModel(payload);
+      model.visible = true;
+      model.analysis = null;
+      if (!firstId) firstId = model.id;
+    }
+    if (!state.models.has(state.selectedId)) {
+      state.selectedId = firstId || state.models.keys().next().value || null;
+    }
+  }
+  state.layFlatIndex = 0;
+  renderModelList();
+  await refreshSelection();
+  fitPlateToModels();
+}
+
+$('undo-button').addEventListener('click', () => stepHistory('undo'));
+$('redo-button').addEventListener('click', () => stepHistory('redo'));
 
 for (const button of document.querySelectorAll('[data-rotate]')) {
   button.addEventListener('click', () => {
@@ -748,6 +922,31 @@ $('apply-unit').addEventListener('click', () => {
   applyTransform(scaleMatrix(factor, factor, factor), 'Converting units…')
     .then(() => { model.unit = 'millimeter'; });
 });
+
+$('layflat-button').addEventListener('click', runLayFlat);
+
+for (const button of document.querySelectorAll('[data-split-axis]')) {
+  button.addEventListener('click', () => {
+    state.split.axis = Number(button.dataset.splitAxis);
+    refreshSplitControls({ resetPosition: true });
+  });
+}
+
+$('split-slider').addEventListener('input', () => {
+  const range = splitRange();
+  if (!range) return;
+  state.split.position = range.min + ((range.max - range.min) * Number($('split-slider').value)) / 1000;
+  refreshSplitControls();
+});
+
+$('split-position').addEventListener('change', () => {
+  const value = Number($('split-position').value);
+  if (Number.isFinite(value)) state.split.position = value;
+  refreshSplitControls();
+});
+
+$('split-middle').addEventListener('click', () => refreshSplitControls({ resetPosition: true }));
+$('split-button').addEventListener('click', runSplit);
 
 $('centre-button').addEventListener('click', () => {
   const model = selected();

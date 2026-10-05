@@ -10,23 +10,74 @@ import { Mesh } from './mesh/core.js';
 import { analyze, collectHighlights } from './mesh/analyze.js';
 import { repair } from './mesh/repair.js';
 import { separateShells } from './mesh/shells.js';
+import { layFlatTransform } from './mesh/layflat.js';
+import { splitByPlane, AXIS_NAMES } from './mesh/split.js';
 import { loadFile, exportMeshes } from './io/index.js';
 
-const models = new Map();   // id -> { mesh, history: Mesh[], future: Mesh[], name, format }
+const models = new Map();   // id -> { mesh, name, format }
 let nextId = 1;
-const HISTORY_LIMIT = 12;
+const HISTORY_LIMIT = 16;
+
+/**
+ * One undo stack for everything.
+ *
+ * Editing a mesh and splitting one in two are different shapes of change — the
+ * first replaces a model's geometry, the second swaps one model for two — but
+ * they share an order, and a per-model history cannot express "undo the split".
+ * Recording both kinds on one stack means Undo always reverses whatever
+ * actually happened last.
+ */
+const undoStack = [];
+const redoStack = [];
+
+function record(step) {
+  undoStack.push(step);
+  if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+}
+
+function historyState() {
+  return { canUndo: undoStack.length > 0, canRedo: redoStack.length > 0 };
+}
 
 function store(mesh, name, format) {
   const id = `m${nextId++}`;
-  models.set(id, { mesh, history: [], future: [], name: name || mesh.name || 'model', format });
+  models.set(id, { mesh, name: name || mesh.name || 'model', format });
   return id;
 }
 
-function commit(entry, mesh) {
-  entry.history.push(entry.mesh);
-  if (entry.history.length > HISTORY_LIMIT) entry.history.shift();
-  entry.future.length = 0;
+/** Replace one model's geometry, remembering what it was. */
+function commit(id, mesh) {
+  const entry = models.get(id);
+  record({ kind: 'mesh', id, before: entry.mesh, after: mesh });
   entry.mesh = mesh;
+}
+
+/** Swap models in and out as one reversible step. */
+function restructure(removeIds, additions) {
+  const removed = removeIds
+    .filter((id) => models.has(id))
+    .map((id) => ({ id, entry: models.get(id) }));
+  for (const { id } of removed) models.delete(id);
+  const added = [];
+  for (const { mesh, name, format } of additions) {
+    added.push(store(mesh, name, format));
+  }
+  record({ kind: 'structural', removed, added });
+  return added;
+}
+
+/** Everything the page needs to redraw after a structural change. */
+function structuralPayload(removedIds, addedIds) {
+  const models_ = addedIds.map((id) => summary(id));
+  return {
+    payload: {
+      removed: removedIds,
+      models: models_.map((s) => s.payload),
+      history: historyState(),
+    },
+    transfer: models_.flatMap((s) => s.transfer),
+  };
 }
 
 function summary(id) {
@@ -42,8 +93,6 @@ function summary(id) {
       triangles: mesh.triangleCount,
       vertices: mesh.vertexCount,
       bounds: mesh.bounds(),
-      canUndo: entry.history.length > 0,
-      canRedo: entry.future.length > 0,
       buffers,
     },
     transfer: [buffers.position.buffer, buffers.normal.buffer],
@@ -179,6 +228,43 @@ function buildDemoMesh() {
   return mesh;
 }
 
+/** Apply a history step in either direction. */
+function reverse(step, direction) {
+  if (step.kind === 'mesh') {
+    const entry = models.get(step.id);
+    if (!entry) throw new Error('That model is no longer loaded.');
+    entry.mesh = direction === 'undo' ? step.before : step.after;
+    const s = summary(step.id);
+    return {
+      payload: {
+        kind: 'mesh', id: step.id, model: s.payload,
+        analysis: analyze(entry.mesh), history: historyState(),
+      },
+      transfer: s.transfer,
+    };
+  }
+
+  // Structural: undo puts back what was removed and drops what was added;
+  // redo does the opposite.
+  const takeOut = direction === 'undo' ? step.added : step.removed.map((r) => r.id);
+  const putBack = direction === 'undo' ? step.removed : step.addedEntries;
+
+  if (direction === 'undo') {
+    step.addedEntries = step.added.map((id) => ({ id, entry: models.get(id) }));
+  }
+  for (const id of takeOut) models.delete(id);
+  for (const { id, entry } of putBack) models.set(id, entry);
+
+  const restored = putBack.map(({ id }) => summary(id));
+  return {
+    payload: {
+      kind: 'structural', removed: takeOut,
+      models: restored.map((r) => r.payload), history: historyState(),
+    },
+    transfer: restored.flatMap((r) => r.transfer),
+  };
+}
+
 const handlers = {
   load({ filename, buffer }) {
     const result = loadFile(filename, buffer);
@@ -204,11 +290,11 @@ const handlers = {
     const entry = models.get(id);
     if (!entry) throw new Error('That model is no longer loaded.');
     const result = repair(entry.mesh, options, (fraction, label) => report(fraction, label));
-    commit(entry, result.mesh);
+    commit(id, result.mesh);
     const s = summary(id);
     return {
       payload: {
-        id, model: s.payload,
+        id, model: s.payload, history: historyState(),
         before: result.before, after: result.after, log: result.log, tolerance: result.tolerance,
       },
       transfer: s.transfer,
@@ -229,9 +315,62 @@ const handlers = {
     const entry = models.get(id);
     if (!entry) throw new Error('That model is no longer loaded.');
     const next = entry.mesh.clone().applyMatrix4(matrix);
-    commit(entry, next);
+    commit(id, next);
     const s = summary(id);
-    return { payload: { id, model: s.payload }, transfer: s.transfer };
+    return { payload: { id, model: s.payload, history: historyState() }, transfer: s.transfer };
+  },
+
+  /**
+   * Turn a model onto one of the faces it can actually rest on, and set it down.
+   * `index` walks through the alternatives, best first.
+   */
+  layflat({ id, index }) {
+    const entry = models.get(id);
+    if (!entry) throw new Error('That model is no longer loaded.');
+    const result = layFlatTransform(entry.mesh, index || 0);
+    if (!result) {
+      return { payload: { id, applied: false, reason: 'This model is flat or has no volume to stand on.' } };
+    }
+    const next = entry.mesh.clone().applyMatrix4(result.matrix);
+    commit(id, next);
+    const s = summary(id);
+    return {
+      payload: {
+        id, model: s.payload, applied: true, history: historyState(),
+        contactArea: result.candidate.contactArea,
+        stable: result.candidate.stable,
+        height: result.candidate.height,
+        candidates: result.candidates.length,
+        index: (index || 0) % result.candidates.length,
+      },
+      transfer: s.transfer,
+    };
+  },
+
+  /** Cut a model in two along a plane, capping both halves. */
+  split({ id, axis, position }) {
+    const entry = models.get(id);
+    if (!entry) throw new Error('That model is no longer loaded.');
+    const result = splitByPlane(entry.mesh, axis, position);
+    if (!result.below.triangleCount || !result.above.triangleCount) {
+      return {
+        payload: {
+          id, applied: false,
+          reason: `The ${AXIS_NAMES[axis]} plane at ${position.toFixed(2)} does not pass through the model.`,
+        },
+      };
+    }
+    const added = restructure([id], [
+      { mesh: result.below, name: result.below.name, format: entry.format },
+      { mesh: result.above, name: result.above.name, format: entry.format },
+    ]);
+    const s = structuralPayload([id], added);
+    s.payload.applied = true;
+    s.payload.axis = axis;
+    s.payload.position = position;
+    s.payload.crossSectionArea = result.crossSectionArea;
+    s.payload.leftOpen = result.leftOpen;
+    return s;
   },
 
   separate({ id }) {
@@ -239,30 +378,22 @@ const handlers = {
     if (!entry) throw new Error('That model is no longer loaded.');
     const parts = separateShells(entry.mesh);
     if (parts.length < 2) return { payload: { models: [], reason: 'This model is a single connected body.' } };
-    models.delete(id);
-    const out = parts.map((mesh) => summary(store(mesh, mesh.name, entry.format)).payload);
-    return {
-      payload: { removed: id, models: out },
-      transfer: out.flatMap((m) => [m.buffers.position.buffer, m.buffers.normal.buffer]),
-    };
+    const added = restructure([id], parts.map((mesh) => ({ mesh, name: mesh.name, format: entry.format })));
+    return structuralPayload([id], added);
   },
 
-  undo({ id }) {
-    const entry = models.get(id);
-    if (!entry || !entry.history.length) throw new Error('Nothing to undo.');
-    entry.future.push(entry.mesh);
-    entry.mesh = entry.history.pop();
-    const s = summary(id);
-    return { payload: { id, model: s.payload, analysis: analyze(entry.mesh) }, transfer: s.transfer };
+  undo() {
+    const step = undoStack.pop();
+    if (!step) throw new Error('Nothing to undo.');
+    redoStack.push(step);
+    return reverse(step, 'undo');
   },
 
-  redo({ id }) {
-    const entry = models.get(id);
-    if (!entry || !entry.future.length) throw new Error('Nothing to redo.');
-    entry.history.push(entry.mesh);
-    entry.mesh = entry.future.pop();
-    const s = summary(id);
-    return { payload: { id, model: s.payload, analysis: analyze(entry.mesh) }, transfer: s.transfer };
+  redo() {
+    const step = redoStack.pop();
+    if (!step) throw new Error('Nothing to redo.');
+    undoStack.push(step);
+    return reverse(step, 'redo');
   },
 
   export({ ids, format, options }) {
@@ -282,7 +413,9 @@ const handlers = {
 
   remove({ id }) {
     models.delete(id);
-    return { payload: { id } };
+    // Deliberately not recorded: closing a model is housekeeping, and leaving
+    // it on the undo stack would mean Undo reopens something the user shut.
+    return { payload: { id, history: historyState() } };
   },
 };
 
